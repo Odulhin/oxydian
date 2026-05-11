@@ -1,26 +1,32 @@
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use egui_extras::{Size, StripBuilder};
+use egui_file_dialog::{FileDialog, FileDialogStorage};
+// use egui_ltreeview::TreeView;
+use std::path::PathBuf;
 
 /// We derive Deserialize/Serialize so we can persist app state on shutdown.
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(default)] // if we add new fields, give them default values when deserializing old state
 pub struct App {
-    // Example stuff:
     label: String,
     text_buffer: String,
-    #[serde(skip)] // This how you opt-out of serialization of a field
+    #[serde(skip)]
     cache: CommonMarkCache,
     value: f32,
+    #[serde(skip)]
+    file_dialog: FileDialog,
+    picked_file: Option<PathBuf>,
 }
 
 impl Default for App {
     fn default() -> Self {
         Self {
-            // Example stuff:
             label: "Hello World!".to_owned(),
             value: 2.7,
             cache: CommonMarkCache::default(),
             text_buffer: String::new(),
+            file_dialog: FileDialog::default(),
+            picked_file: None,
         }
     }
 }
@@ -35,13 +41,19 @@ impl App {
             style.url_in_tooltip = true;
         });
 
-        // Load previous app state (if any).
-        // Note that you must enable the `persistence` feature for this to work.
-        if let Some(storage) = cc.storage {
+        let mut app: App = if let Some(storage) = cc.storage {
             eframe::get_value(storage, eframe::APP_KEY).unwrap_or_default()
         } else {
             Default::default()
+        };
+
+        if let Some(storage) = cc.storage {
+            *app.file_dialog.storage_mut() =
+                eframe::get_value::<FileDialogStorage>(storage, "file_dialog_storage")
+                    .unwrap_or_default();
         }
+
+        app
     }
 }
 
@@ -49,6 +61,11 @@ impl eframe::App for App {
     /// Called by the framework to save state before shutdown.
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, eframe::APP_KEY, self);
+        eframe::set_value(
+            storage,
+            "file_dialog_storage",
+            &self.file_dialog.storage_mut().clone(),
+        );
     }
 
     /// Called each time the UI needs repainting, which may be many times per second.
@@ -76,11 +93,27 @@ impl eframe::App for App {
             });
         });
 
+        egui::Panel::left("side_panel").show_inside(ui, |ui| {
+            if ui.button("Pick file").clicked() {
+                // Open the file dialog to pick a file.
+                self.file_dialog.pick_file();
+            }
+
+            ui.label(format!("Picked file: {:?}", self.picked_file));
+
+            // Update the dialog
+            self.file_dialog.update(ui);
+
+            // Check if the user picked a file.
+            if let Some(path) = self.file_dialog.take_picked() {
+                self.picked_file = Some(path.to_path_buf());
+            }
+        });
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            // The central panel the region left after adding TopPanel's and SidePanel's
-            ui.heading("<file name>");
+            ui.heading(format!("{:?}", self.picked_file));
 
             ui.separator();
+
             egui::ScrollArea::vertical().show(ui, |ui| {
                 StripBuilder::new(ui)
                     .sizes(Size::remainder(), 2)
@@ -99,10 +132,6 @@ impl eframe::App for App {
                                 &mut self.text_buffer,
                             );
                         });
-                        // strip.strip(|builder| {
-                        //     builder.sizes(Size::remainder(), 2).horizontal(|mut strip| {
-                        //     });
-                        // });
                     });
             });
 
