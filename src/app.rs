@@ -1,8 +1,18 @@
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use egui_extras::{Size, StripBuilder};
 use egui_file_dialog::{FileDialog, FileDialogStorage};
-// use egui_ltreeview::TreeView;
-use std::path::PathBuf;
+use egui_ltreeview::{TreeView, TreeViewState};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct TreeEntry {
+    id: u32,
+    name: String,
+    path: PathBuf,
+    is_dir: bool,
+    children: Vec<TreeEntry>,
+}
 
 /// We derive Deserialize/Serialize so we can persist app state on shutdown.
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -16,6 +26,11 @@ pub struct App {
     #[serde(skip)]
     file_dialog: FileDialog,
     picked_file: Option<PathBuf>,
+    #[serde(skip)]
+    tree_state: TreeViewState<u32>,
+    #[serde(skip)]
+    cached_root: Option<PathBuf>,
+    cached_entries: Option<Vec<TreeEntry>>,
 }
 
 impl Default for App {
@@ -27,11 +42,103 @@ impl Default for App {
             text_buffer: String::new(),
             file_dialog: FileDialog::default(),
             picked_file: None,
+            tree_state: TreeViewState::default(),
+            cached_root: None,
+            cached_entries: None,
         }
     }
 }
 
 impl App {
+    /// Builds a cached tree structure from a directory path.
+    fn build_cached_tree(&mut self, path: &Path) -> Vec<TreeEntry> {
+        let mut id_counter = 0u32;
+        Self::build_tree_recursive(path, &mut id_counter)
+    }
+
+    /// Renders the tree view from cached entries.
+    fn render_tree_from_cache(
+        builder: &mut egui_ltreeview::TreeViewBuilder<'_, u32>,
+        entries: &[TreeEntry],
+    ) {
+        for entry in entries {
+            if entry.is_dir {
+                builder.dir(entry.id, &entry.name);
+                Self::render_tree_from_cache(builder, &entry.children);
+                builder.close_dir();
+            } else {
+                builder.leaf(entry.id, &entry.name);
+            }
+        }
+    }
+
+    /// Sets all directory entries to be closed in the tree state.
+    fn close_all_directories_in_state(&mut self, entries: &[TreeEntry]) {
+        for entry in entries {
+            if entry.is_dir {
+                self.tree_state.set_openness(entry.id, false);
+                self.close_all_directories_in_state(&entry.children);
+            }
+        }
+    }
+
+    /// Recursively builds tree entries from filesystem.
+    fn build_tree_recursive(path: &Path, id_counter: &mut u32) -> Vec<TreeEntry> {
+        let mut entries = Vec::new();
+
+        if let Ok(read_dir) = fs::read_dir(path) {
+            let mut dir_entries: Vec<_> = read_dir
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .collect();
+
+            // Sort: directories first, then alphabetically
+            dir_entries.sort_by(|a, b| {
+                let a_is_dir = a.is_dir();
+                let b_is_dir = b.is_dir();
+                if a_is_dir != b_is_dir {
+                    b_is_dir.cmp(&a_is_dir)
+                } else {
+                    let a_name = a.file_name().unwrap_or_default().to_string_lossy();
+                    let b_name = b.file_name().unwrap_or_default().to_string_lossy();
+                    a_name.cmp(&b_name)
+                }
+            });
+
+            for entry_path in dir_entries {
+                let name = entry_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                let is_dir = entry_path.is_dir();
+                let current_id = *id_counter;
+                *id_counter += 1;
+
+                if is_dir {
+                    let children = Self::build_tree_recursive(&entry_path, id_counter);
+                    entries.push(TreeEntry {
+                        id: current_id,
+                        name,
+                        path: entry_path,
+                        is_dir: true,
+                        children,
+                    });
+                } else {
+                    entries.push(TreeEntry {
+                        id: current_id,
+                        name,
+                        path: entry_path,
+                        is_dir: false,
+                        children: Vec::new(),
+                    });
+                }
+            }
+        }
+
+        entries
+    }
+
     /// Called once before the first frame.
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         // This is also where you can customize the look and feel of egui using
@@ -84,6 +191,12 @@ impl eframe::App for App {
                         if ui.button("Quit").clicked() {
                             ui.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
+                        if ui.button("Pick folder").clicked() {
+                            // Open the file dialog to pick a folder.
+                            self.file_dialog.pick_directory();
+                        }
+                        // Update the dialog
+                        self.file_dialog.update(ui);
                     });
                     ui.add_space(16.0);
                 }
@@ -94,21 +207,71 @@ impl eframe::App for App {
         });
 
         egui::Panel::left("side_panel").show_inside(ui, |ui| {
-            if ui.button("Pick file").clicked() {
-                // Open the file dialog to pick a file.
-                self.file_dialog.pick_file();
+            // if ui.button("Pick folder").clicked() {
+            //     // Open the file dialog to pick a folder.
+            //     self.file_dialog.pick_directory();
+            // }
+            // ui.separator();
+            // ui.label(format!("Picked folder: {:?}", self.picked_file));
+
+            // // Update the dialog
+            // self.file_dialog.update(ui);
+
+            // Rebuild cached entries if we have a picked file but no cached entries
+            // (happens on first load with persisted picked_file)
+            if self.picked_file.is_some() && self.cached_entries.is_none() {
+                if let Some(root_path) = &self.picked_file {
+                    let root_to_scan = if root_path.is_dir() {
+                        root_path.clone()
+                    } else if let Some(parent) = root_path.parent() {
+                        parent.to_path_buf()
+                    } else {
+                        root_path.clone()
+                    };
+                    let entries = self.build_cached_tree(&root_to_scan);
+                    self.cached_entries = Some(entries.clone());
+                    self.tree_state = TreeViewState::default();
+                    self.close_all_directories_in_state(&entries);
+                }
             }
-
-            ui.label(format!("Picked file: {:?}", self.picked_file));
-
-            // Update the dialog
-            self.file_dialog.update(ui);
 
             // Check if the user picked a file.
             if let Some(path) = self.file_dialog.take_picked() {
-                self.picked_file = Some(path.to_path_buf());
+                let new_path = path.to_path_buf();
+                // Only rebuild if path actually changed
+                if self.picked_file.as_ref() != Some(&new_path) {
+                    self.picked_file = Some(new_path.clone());
+                    self.cached_root = Some(new_path.clone());
+
+                    // Build cached tree from the directory (or parent if file selected)
+                    let root_to_scan = if new_path.is_dir() {
+                        new_path.clone()
+                    } else if let Some(parent) = new_path.parent() {
+                        parent.to_path_buf()
+                    } else {
+                        new_path.clone()
+                    };
+
+                    let entries = self.build_cached_tree(&root_to_scan);
+                    self.cached_entries = Some(entries.clone());
+                    self.tree_state = TreeViewState::default();
+                    self.close_all_directories_in_state(&entries);
+                }
             }
+
+            egui::ScrollArea::both().show(ui, |ui| {
+                TreeView::new(egui::Id::new("tree view")).show_state(
+                    ui,
+                    &mut self.tree_state,
+                    |builder| {
+                        if let Some(entries) = &self.cached_entries {
+                            Self::render_tree_from_cache(builder, entries);
+                        }
+                    },
+                );
+            });
         });
+
         egui::CentralPanel::default().show_inside(ui, |ui| {
             ui.heading(format!("{:?}", self.picked_file));
 
